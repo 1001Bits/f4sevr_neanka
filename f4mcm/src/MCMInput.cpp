@@ -56,6 +56,15 @@ void MCMInput::OnButtonEvent(ButtonEvent * inputEvent)
 	UInt32	deviceType = inputEvent->deviceType;
 	UInt32	keyMask = inputEvent->keyMask;
 
+	// Debug: Log all button events
+	static int logCount = 0;
+	if (logCount < 50) {
+		BSFixedString* controlID = inputEvent->GetControlID();
+		_MESSAGE("MCMInput: Button event - deviceType=%u keyMask=%u isDown=%.1f timer=%.2f control=%s", 
+			deviceType, keyMask, inputEvent->isDown, inputEvent->timer,
+			controlID ? controlID->c_str() : "null");
+		logCount++;
+	}
 	
 	if (deviceType == InputEvent::kDeviceType_Mouse) {
 		// Mouse

@@ -20,6 +20,15 @@
 #include "SettingStore.h"
 #include "MCMKeybinds.h"
 
+// VR-native controller input
+#include "MCMVRInput.h"
+
+#include <chrono>
+
+// Debounce timer for GoBackOneMenu to prevent double-trigger
+static std::chrono::steady_clock::time_point g_lastGoBackTime;
+static bool g_goBackTimeInitialized = false;
+
 namespace ScaleformMCM {
 
 	// function GetMCMVersionString():String;
@@ -77,6 +86,8 @@ namespace ScaleformMCM {
 		virtual void Invoke(Args* args) {
 			// Start key handler
 			RegisterForInput(true);
+			// Initialize VR-native input
+			MCMVRInput::Initialize();
 		}
 	};
 
@@ -807,13 +818,87 @@ void ScaleformMCM::RegisterFuncs(GFxValue* codeObj, GFxMovieRoot* movieRoot) {
 class F4SEInputHandler : public BSInputEventUser
 {
 public:
-	F4SEInputHandler() : BSInputEventUser(true) { }
+	F4SEInputHandler() : BSInputEventUser(true), m_lastThumbstickDirectionLeft(0), m_lastThumbstickDirectionRight(0) { }
 
 	virtual void OnButtonEvent(ButtonEvent * inputEvent)
 	{
+		// Poll VR controllers directly - bypasses game's broken VR→gamepad translation
+		MCMVRInput::Update();
+
 		UInt32	keyCode;
 		UInt32	deviceType = inputEvent->deviceType;
 		UInt32	keyMask = inputEvent->keyMask;
+
+		float timer	 = inputEvent->timer;
+		bool  isDown = inputEvent->isDown == 1.0f && timer == 0.0f;
+		bool  isUp   = inputEvent->isDown == 0.0f && timer != 0.0f;
+
+		BSFixedString* control = inputEvent->GetControlID();
+		const char* controlName = control ? control->c_str() : "";
+
+		// VR Controller handling (deviceType 4 = Kinect/VR)
+		if (deviceType == 4) {
+			// Debug: Log VR button events
+			static int vrLogCount = 0;
+			if (vrLogCount < 50) {
+				_MESSAGE("MCM VR Button: control='%s' keyMask=%u isDown=%.1f timer=%.2f", 
+					controlName, keyMask, inputEvent->isDown, timer);
+				vrLogCount++;
+			}
+
+			// Translate VR control names to MCM actions
+			const char* mcmControl = nullptr;
+			UInt32 mcmKeyCode = 0;
+
+			if (strcmp(controlName, "WandTrigger") == 0 || 
+			    strcmp(controlName, "SecondaryTrigger") == 0) {
+				// Trigger = Accept/Select
+				mcmControl = "Accept";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_A;
+			}
+			else if (strcmp(controlName, "WandGrip") == 0 ||
+			         strcmp(controlName, "SecondaryGrip") == 0 ||
+			         strcmp(controlName, "Grip") == 0 ||
+			         keyMask == 34) {  // keyMask 34 = grip on VR
+				// Grip = Tab Left (go back one menu level, NOT close entire menu)
+				mcmControl = "LShoulder";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_LEFT_SHOULDER;
+			}
+			// Thumbstick directions (these may come as ButtonEvents in VR)
+			else if (strcmp(controlName, "Forward") == 0) {
+				mcmControl = "Up";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_DPAD_UP;
+			}
+			else if (strcmp(controlName, "Back") == 0) {
+				mcmControl = "Down";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_DPAD_DOWN;
+			}
+			else if (strcmp(controlName, "StrafeLeft") == 0) {
+				mcmControl = "Left";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_DPAD_LEFT;
+			}
+			else if (strcmp(controlName, "StrafeRight") == 0) {
+				mcmControl = "Right";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_DPAD_RIGHT;
+			}
+
+			if (mcmControl) {
+				if (isDown) {
+					ScaleformMCM::ProcessKeyEvent(mcmKeyCode, true);
+					ScaleformMCM::ProcessUserEvent(mcmControl, true, InputEvent::kDeviceType_Gamepad);
+				} else if (isUp) {
+					ScaleformMCM::ProcessKeyEvent(mcmKeyCode, false);
+					ScaleformMCM::ProcessUserEvent(mcmControl, false, InputEvent::kDeviceType_Gamepad);
+					
+					// After grip release (go back), clear submenu selection and fix highlight
+					if (strcmp(mcmControl, "LShoulder") == 0) {
+						_MESSAGE("MCM Grip released - calling GoBackOneMenu");
+						ScaleformMCM::GoBackOneMenu();
+					}
+				}
+			}
+			return;  // Don't process VR events through normal path
+		}
 
 		if (deviceType == InputEvent::kDeviceType_Mouse) {
 			// Mouse
@@ -827,18 +912,121 @@ public:
 			keyCode = keyMask;
 		}
 
-		float timer	 = inputEvent->timer;
-		bool  isDown = inputEvent->isDown == 1.0f && timer == 0.0f;
-		bool  isUp   = inputEvent->isDown == 0.0f && timer != 0.0f;
-
-		BSFixedString* control = inputEvent->GetControlID();
-
 		if (isDown) {
 			ScaleformMCM::ProcessKeyEvent(keyCode, true);
-			ScaleformMCM::ProcessUserEvent(control->c_str(), true, deviceType);
+			ScaleformMCM::ProcessUserEvent(controlName, true, deviceType);
 		} else if (isUp) {
 			ScaleformMCM::ProcessKeyEvent(keyCode, false);
-			ScaleformMCM::ProcessUserEvent(control->c_str(), false, deviceType);
+			ScaleformMCM::ProcessUserEvent(controlName, false, deviceType);
+		}
+	}
+
+	// VR Fix: Handle thumbstick events for menu navigation
+	virtual void OnThumbstickEvent(ThumbstickEvent * inputEvent)
+	{
+		// NOTE: We do NOT call MCMVRInput::Update() here anymore.
+		// We now directly call NavigateList() which is more reliable.
+		// Calling both would cause double-navigation on some controllers.
+
+		if (!inputEvent) return;
+
+		// Process BOTH thumbsticks for menu navigation
+		// In pause menu, right stick has no other function, so use it for navigation too
+		
+		// Debug: Log thumbstick events only when direction changes
+		if (inputEvent->direction != inputEvent->previousDirection) {
+			_MESSAGE("MCM Thumbstick: stick=0x%X prevDir=%u dir=%u x=%.2f y=%.2f", 
+				inputEvent->stick, inputEvent->previousDirection, inputEvent->direction,
+				inputEvent->x, inputEvent->y);
+		}
+
+		// Track both sticks independently to avoid conflicts
+		UInt32& lastDirection = (inputEvent->stick == 0xB) ? 
+			m_lastThumbstickDirectionLeft : m_lastThumbstickDirectionRight;
+
+		// Thumbstick directions: 0=none, 1=up, 2=right, 3=down, 4=left
+		UInt32 newDirection = inputEvent->direction;
+		UInt32 previousDirection = inputEvent->previousDirection;
+
+		// Only process when direction changes
+		if (newDirection == previousDirection) return;
+
+		// Release previous direction
+		if (lastDirection != 0) {
+			const char* releaseControl = GetControlNameForDirection(lastDirection);
+			if (releaseControl) {
+				UInt32 keyCode = GetKeycodeForDirection(lastDirection);
+				ScaleformMCM::ProcessKeyEvent(keyCode, false);
+				ScaleformMCM::ProcessUserEvent(releaseControl, false, InputEvent::kDeviceType_Gamepad);
+			}
+		}
+
+		// Press new direction - call list navigation directly
+		if (newDirection != 0) {
+			const char* pressControl = GetControlNameForDirection(newDirection);
+			if (pressControl) {
+				_MESSAGE("MCM Thumbstick PRESS: stick=0x%X dir=%u control='%s'", inputEvent->stick, newDirection, pressControl);
+				
+				// Left thumbstick (0xB) only handles left/right for slider control
+				// Up/down navigation is handled by right thumbstick only
+				bool isLeftStick = (inputEvent->stick == 0xB);
+				bool isUpDown = (newDirection == 1 || newDirection == 3);
+				
+				if (isLeftStick && isUpDown) {
+					// Skip up/down on left thumbstick - don't navigate
+					_MESSAGE("MCM Thumbstick: Skipping up/down on left stick");
+				} else {
+					// Directly call NavigateList for all directions
+					// 1=up, 2=right, 3=down, 4=left
+					ScaleformMCM::NavigateList(newDirection);
+				}
+			}
+		}
+
+		lastDirection = newDirection;
+	}
+
+private:
+	UInt32 m_lastThumbstickDirectionLeft;
+	UInt32 m_lastThumbstickDirectionRight;
+
+	const char* GetControlNameForDirection(UInt32 direction)
+	{
+		switch (direction) {
+			case 1: return "Up";
+			case 2: return "Right";
+			case 3: return "Down";
+			case 4: return "Left";
+			default: return nullptr;
+		}
+	}
+
+	UInt32 GetKeycodeForDirection(UInt32 direction)
+	{
+		// MCM's ProcessUserEvent for gamepad (deviceType 2) sends WASD keys, NOT arrow keys!
+		// From MCM_Menu.as ProcessUserEvent:
+		//   case "Up": this.ProcessKeyEvent(Keyboard.W, false);  // W = 87
+		//   case "Down": this.ProcessKeyEvent(Keyboard.S, false);  // S = 83
+		//   case "Left": this.ProcessKeyEvent(Keyboard.A, false);  // A = 65
+		//   case "Right": this.ProcessKeyEvent(Keyboard.D, false);  // D = 68
+		switch (direction) {
+			case 1: return 87;  // W key (up)
+			case 2: return 68;  // D key (right)
+			case 3: return 83;  // S key (down)
+			case 4: return 65;  // A key (left)
+			default: return 0;
+		}
+	}
+
+	// Left thumbstick sends gamepad DPAD keycodes - maybe MCM checks for these?
+	UInt32 GetLeftThumbstickKeycodeForDirection(UInt32 direction)
+	{
+		switch (direction) {
+			case 1: return 266;  // Gamepad DPAD Up
+			case 2: return 267;  // Gamepad DPAD Right  
+			case 3: return 268;  // Gamepad DPAD Down
+			case 4: return 269;  // Gamepad DPAD Left
+			default: return 0;
 		}
 	}
 };
@@ -853,7 +1041,17 @@ void ScaleformMCM::ProcessKeyEvent(UInt32 keyCode, bool isDown)
 		GFxValue args[2];
 		args[0].SetInt(keyCode);
 		args[1].SetBool(isDown);
+		_MESSAGE("MCM ProcessKeyEvent: keyCode=%u isDown=%d", keyCode, isDown);
+		
+		// Try MCM's content handler
 		movieRoot->Invoke("root.mcm_loader.content.ProcessKeyEvent", nullptr, args, 2);
+		
+		// Also try native pause menu paths that might handle navigation
+		// These are common Scaleform/Flash patterns for menu navigation
+		movieRoot->Invoke("root.Menu_mc.ProcessKeyEvent", nullptr, args, 2);
+		movieRoot->Invoke("root.ProcessKeyEvent", nullptr, args, 2);
+	} else {
+		_MESSAGE("MCM ProcessKeyEvent SKIPPED: PauseMenu not open, keyCode=%u", keyCode);
 	}
 }
 
@@ -871,6 +1069,268 @@ void ScaleformMCM::ProcessUserEvent(const char * controlName, bool isDown, int d
 	}
 }
 
+// Directly navigate MCM list - bypasses event system for more reliable VR input
+// Directions: 1=up, 2=right, 3=down, 4=left
+void ScaleformMCM::NavigateList(int direction)
+{
+	BSFixedString mainMenuStr("PauseMenu");
+	if (!(*G::ui)->IsMenuOpen(mainMenuStr)) return;
+	
+	IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	GFxMovieRoot* movieRoot = menu->movie->movieRoot;
+	
+	// Get the MCM menu content
+	GFxValue mcmContent;
+	if (!movieRoot->GetVariable(&mcmContent, "root.mcm_loader.content.mcmMenu")) {
+		_MESSAGE("MCM NavigateList: Failed to get mcmMenu");
+		return;
+	}
+	
+	// Get references to both lists
+	GFxValue configPanel, configList, helpPanel, helpList;
+	bool hasConfigList = mcmContent.GetMember("configPanel_mc", &configPanel) && 
+	                     configPanel.GetMember("configList_mc", &configList);
+	bool hasHelpList = mcmContent.GetMember("HelpPanel_mc", &helpPanel) && 
+	                   helpPanel.GetMember("HelpList_mc", &helpList);
+	
+	// Check selectedIndex on both lists
+	// MCM sets selectedIndex = -1 on the inactive list when switching focus
+	int configIndex = -1, helpIndex = -1;
+	
+	if (hasConfigList) {
+		GFxValue idx;
+		if (configList.GetMember("selectedIndex", &idx) && 
+		    (idx.GetType() == GFxValue::kType_Int || idx.GetType() == GFxValue::kType_Number)) {
+			configIndex = (int)idx.GetNumber();
+		}
+	}
+	
+	if (hasHelpList) {
+		GFxValue idx;
+		if (helpList.GetMember("selectedIndex", &idx) && 
+		    (idx.GetType() == GFxValue::kType_Int || idx.GetType() == GFxValue::kType_Number)) {
+			helpIndex = (int)idx.GetNumber();
+		}
+	}
+	
+	_MESSAGE("MCM NavigateList: dir=%d configIndex=%d, helpIndex=%d", direction, configIndex, helpIndex);
+	
+	// Determine which list is active
+	bool configActive = (hasConfigList && configIndex >= 0);
+	bool helpActive = (!configActive && hasHelpList);
+	
+	// Handle left/right based on which list is active
+	if (direction == 4) {  // LEFT
+		if (configActive) {
+			// In configList: adjust sliders/steppers by calling Decrement() on the OptionItem
+			// Path: configList.selectedEntry.clipIndex -> GetClipByIndex -> child OptionItem -> Decrement()
+			GFxValue selectedEntry;
+			if (configList.GetMember("selectedEntry", &selectedEntry) && !selectedEntry.IsNull() && !selectedEntry.IsUndefined()) {
+				_MESSAGE("MCM NavigateList LEFT: Got selectedEntry, type=%d", selectedEntry.GetType());
+				GFxValue clipIndex;
+				bool hasClipIndex = selectedEntry.GetMember("clipIndex", &clipIndex);
+				_MESSAGE("MCM NavigateList LEFT: hasClipIndex=%d, clipIndex type=%d", hasClipIndex, clipIndex.GetType());
+				
+				// clipIndex can be Int, UInt, Number, or String - handle all cases
+				int clipIndexValue = -1;
+				if (hasClipIndex) {
+					if (clipIndex.GetType() == GFxValue::kType_Int || 
+					    clipIndex.GetType() == GFxValue::kType_UInt || 
+					    clipIndex.GetType() == GFxValue::kType_Number) {
+						clipIndexValue = (int)clipIndex.GetNumber();
+						_MESSAGE("MCM NavigateList LEFT: clipIndex from number = %d", clipIndexValue);
+					} else if (clipIndex.GetType() == GFxValue::kType_String) {
+						const char* str = clipIndex.GetString();
+						_MESSAGE("MCM NavigateList LEFT: clipIndex string = '%s'", str ? str : "NULL");
+						if (str) clipIndexValue = atoi(str);
+					} else {
+						_MESSAGE("MCM NavigateList LEFT: clipIndex unknown type %d", clipIndex.GetType());
+					}
+				}
+				_MESSAGE("MCM NavigateList LEFT: clipIndexValue = %d", clipIndexValue);
+				
+				if (clipIndexValue >= 0) {
+					
+					_MESSAGE("MCM NavigateList LEFT: clipIndex = %d", clipIndexValue);
+					
+					GFxValue args[1], settingsOptionItem;
+					args[0].SetNumber(clipIndexValue);
+					bool gotClip = configList.Invoke("GetClipByIndex", &settingsOptionItem, args, 1);
+					_MESSAGE("MCM NavigateList LEFT: GetClipByIndex returned %d, result type=%d", gotClip, settingsOptionItem.GetType());
+					
+					if (!settingsOptionItem.IsNull() && !settingsOptionItem.IsUndefined()) {
+						// SettingsOptionItem has OptionItem as child (added via addChild)
+						GFxValue numChildren;
+						if (settingsOptionItem.GetMember("numChildren", &numChildren)) {
+							int childCount = (int)numChildren.GetNumber();
+							_MESSAGE("MCM NavigateList LEFT: SettingsOptionItem has %d children", childCount);
+							
+							// Try each child - OptionItem is usually added as a child
+							bool found = false;
+							for (int i = childCount - 1; i >= 0 && !found; i--) {
+								GFxValue getChildArgs[1], child;
+								getChildArgs[0].SetNumber(i);
+								settingsOptionItem.Invoke("getChildAt", &child, getChildArgs, 1);
+								
+								if (!child.IsNull() && !child.IsUndefined()) {
+									// Try to call Decrement - if it works, this is a slider
+									GFxValue result;
+									bool success = child.Invoke("Decrement", &result, nullptr, 0);
+									if (success) {
+										_MESSAGE("MCM NavigateList LEFT: Called Decrement on child %d - SUCCESS", i);
+										found = true;
+										break;
+									}
+									
+									// If not, try to access and decrement "index" for steppers
+									GFxValue idx;
+									if (child.GetMember("index", &idx) && 
+									    (idx.GetType() == GFxValue::kType_Int || idx.GetType() == GFxValue::kType_Number)) {
+										int currentIdx = (int)idx.GetNumber();
+										if (currentIdx > 0) {
+											GFxValue newIdx;
+											newIdx.SetNumber(currentIdx - 1);
+											child.SetMember("index", &newIdx);
+											_MESSAGE("MCM NavigateList LEFT: Decremented stepper index from %d to %d", currentIdx, currentIdx - 1);
+											found = true;
+											break;
+										}
+									}
+								}
+							}
+							if (!found) {
+								_MESSAGE("MCM NavigateList LEFT: No slider/stepper child found");
+							}
+						}
+					}
+				}
+			} else {
+				_MESSAGE("MCM NavigateList LEFT: No selectedEntry");
+			}
+			_MESSAGE("MCM NavigateList: LEFT in configList for slider/stepper");
+		} else if (helpActive) {
+			// In HelpList: go back (same as grip/LShoulder)
+			GoBackOneMenu();
+			_MESSAGE("MCM NavigateList: LEFT in HelpList = GoBack");
+		}
+		return;
+	}
+	
+	if (direction == 2) {  // RIGHT
+		if (configActive) {
+			// In configList: adjust sliders/steppers by calling Increment() on the OptionItem
+			GFxValue selectedEntry;
+			if (configList.GetMember("selectedEntry", &selectedEntry) && !selectedEntry.IsNull() && !selectedEntry.IsUndefined()) {
+				_MESSAGE("MCM NavigateList RIGHT: Got selectedEntry, type=%d", selectedEntry.GetType());
+				GFxValue clipIndex;
+				bool hasClipIndex = selectedEntry.GetMember("clipIndex", &clipIndex);
+				_MESSAGE("MCM NavigateList RIGHT: hasClipIndex=%d, clipIndex type=%d", hasClipIndex, clipIndex.GetType());
+				
+				// clipIndex can be Int, UInt, Number, or String - handle all cases
+				int clipIndexValue = -1;
+				if (hasClipIndex) {
+					if (clipIndex.GetType() == GFxValue::kType_Int || 
+					    clipIndex.GetType() == GFxValue::kType_UInt || 
+					    clipIndex.GetType() == GFxValue::kType_Number) {
+						clipIndexValue = (int)clipIndex.GetNumber();
+						_MESSAGE("MCM NavigateList RIGHT: clipIndex from number = %d", clipIndexValue);
+					} else if (clipIndex.GetType() == GFxValue::kType_String) {
+						const char* str = clipIndex.GetString();
+						_MESSAGE("MCM NavigateList RIGHT: clipIndex string = '%s'", str ? str : "NULL");
+						if (str) clipIndexValue = atoi(str);
+					} else {
+						_MESSAGE("MCM NavigateList RIGHT: clipIndex unknown type %d", clipIndex.GetType());
+					}
+				}
+				_MESSAGE("MCM NavigateList RIGHT: clipIndexValue = %d", clipIndexValue);
+				
+				if (clipIndexValue >= 0) {
+					
+					_MESSAGE("MCM NavigateList RIGHT: clipIndex = %d", clipIndexValue);
+					
+					GFxValue args[1], settingsOptionItem;
+					args[0].SetNumber(clipIndexValue);
+					bool gotClip = configList.Invoke("GetClipByIndex", &settingsOptionItem, args, 1);
+					_MESSAGE("MCM NavigateList RIGHT: GetClipByIndex returned %d, result type=%d", gotClip, settingsOptionItem.GetType());
+					
+					if (!settingsOptionItem.IsNull() && !settingsOptionItem.IsUndefined()) {
+						GFxValue numChildren;
+						if (settingsOptionItem.GetMember("numChildren", &numChildren)) {
+							int childCount = (int)numChildren.GetNumber();
+							_MESSAGE("MCM NavigateList RIGHT: SettingsOptionItem has %d children", childCount);
+							
+							bool found = false;
+							for (int i = childCount - 1; i >= 0 && !found; i--) {
+								GFxValue getChildArgs[1], child;
+								getChildArgs[0].SetNumber(i);
+								settingsOptionItem.Invoke("getChildAt", &child, getChildArgs, 1);
+								
+								if (!child.IsNull() && !child.IsUndefined()) {
+									// Try to call Increment - if it works, this is a slider
+									GFxValue result;
+									bool success = child.Invoke("Increment", &result, nullptr, 0);
+									if (success) {
+										_MESSAGE("MCM NavigateList RIGHT: Called Increment on child %d - SUCCESS", i);
+										found = true;
+										break;
+									}
+									
+									// If not, try to access and increment "index" for steppers
+									GFxValue idx;
+									if (child.GetMember("index", &idx) && 
+									    (idx.GetType() == GFxValue::kType_Int || idx.GetType() == GFxValue::kType_Number)) {
+										int currentIdx = (int)idx.GetNumber();
+										// TODO: check max index
+										GFxValue newIdx;
+										newIdx.SetNumber(currentIdx + 1);
+										child.SetMember("index", &newIdx);
+										_MESSAGE("MCM NavigateList RIGHT: Incremented stepper index from %d to %d", currentIdx, currentIdx + 1);
+										found = true;
+										break;
+									}
+								}
+							}
+							if (!found) {
+								_MESSAGE("MCM NavigateList RIGHT: No slider/stepper child found");
+							}
+						}
+					}
+				}
+			} else {
+				_MESSAGE("MCM NavigateList RIGHT: No selectedEntry");
+			}
+			_MESSAGE("MCM NavigateList: RIGHT in configList for slider/stepper");
+		} else if (helpActive) {
+			// In HelpList: enter submenu (same as trigger/RShoulder)
+			GFxValue result;
+			mcmContent.Invoke("RShoulderPressed", &result, nullptr, 0);
+			_MESSAGE("MCM NavigateList: RIGHT in HelpList = Enter submenu");
+		}
+		return;
+	}
+	
+	// Handle up/down - navigate the active list
+	GFxValue* targetList = nullptr;
+	const char* listName = nullptr;
+	
+	if (configActive) {
+		targetList = &configList;
+		listName = "configList_mc";
+	} else if (helpActive) {
+		targetList = &helpList;
+		listName = "HelpList_mc";
+	}
+	
+	if (targetList) {
+		const char* method = (direction == 1) ? "moveSelectionUp" : "moveSelectionDown";
+		GFxValue result;
+		targetList->Invoke(method, &result, nullptr, 0);
+		_MESSAGE("MCM NavigateList: Called %s.%s", listName, method);
+	} else {
+		_MESSAGE("MCM NavigateList: Could not determine which list to navigate");
+	}
+}
+
 void ScaleformMCM::RefreshMenu()
 {
 	BSFixedString mainMenuStr("PauseMenu");
@@ -878,6 +1338,96 @@ void ScaleformMCM::RefreshMenu()
 		IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
 		GFxMovieRoot* movieRoot = menu->movie->movieRoot;
 		movieRoot->Invoke("root.mcm_loader.content.RefreshMCM", nullptr, nullptr, 0);
+	}
+}
+
+// Called after grip/LShoulder to properly clear submenu selection and update highlight
+// On the root menu, this will close the menu instead of going back
+void ScaleformMCM::GoBackOneMenu()
+{
+	// Debounce - ignore if called within 200ms of last call
+	auto currentTime = std::chrono::steady_clock::now();
+	if (g_goBackTimeInitialized) {
+		auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - g_lastGoBackTime).count();
+		if (elapsed < 200) {
+			_MESSAGE("MCM GoBackOneMenu: Debounced (within 200ms of last call, elapsed=%lld)", elapsed);
+			return;
+		}
+	}
+	g_lastGoBackTime = currentTime;
+	g_goBackTimeInitialized = true;
+	
+	BSFixedString mainMenuStr("PauseMenu");
+	if (!(*G::ui)->IsMenuOpen(mainMenuStr)) return;
+	
+	IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	GFxMovieRoot* movieRoot = menu->movie->movieRoot;
+	
+	// Check if we're on the root menu by looking at configPanel's selectedIndex
+	// On root menu: configList has selectedIndex = -1 (no mod selected)
+	// In a mod's settings: configList has selectedIndex >= 0
+	GFxValue configList;
+	bool isOnRootMenu = true;  // Assume root menu
+	
+	if (movieRoot->GetVariable(&configList, "root.mcm_loader.content.mcmMenu.configPanel_mc.configList_mc")) {
+		GFxValue selectedIndex;
+		if (configList.GetMember("selectedIndex", &selectedIndex)) {
+			int idx = -1;
+			if (selectedIndex.GetType() == GFxValue::kType_Int || 
+			    selectedIndex.GetType() == GFxValue::kType_UInt || 
+			    selectedIndex.GetType() == GFxValue::kType_Number) {
+				idx = (int)selectedIndex.GetNumber();
+			}
+			_MESSAGE("MCM GoBackOneMenu: configList selectedIndex = %d (type=%d)", idx, selectedIndex.GetType());
+			if (idx >= 0) {
+				isOnRootMenu = false;  // Has selection = inside a mod's settings
+			}
+		} else {
+			_MESSAGE("MCM GoBackOneMenu: Could not get selectedIndex");
+		}
+	} else {
+		_MESSAGE("MCM GoBackOneMenu: Could not get configList");
+	}
+	
+	if (isOnRootMenu) {
+		// On root menu - send Cancel event to close the menu
+		_MESSAGE("MCM GoBackOneMenu: On root menu - sending Cancel to close");
+		GFxValue args[3];
+		args[0].SetString("Cancel");
+		args[1].SetBool(true);  // isDown
+		args[2].SetInt(InputEvent::kDeviceType_Gamepad);
+		movieRoot->Invoke("root.mcm_loader.content.ProcessUserEvent", nullptr, args, 3);
+		
+		// Also send release
+		args[1].SetBool(false);  // isUp
+		movieRoot->Invoke("root.mcm_loader.content.ProcessUserEvent", nullptr, args, 3);
+		return;
+	}
+	
+	// Not on root menu - go back one level as before
+	// Simply call LShoulderPressed on MCM menu - it handles everything properly
+	// except for clearing configList.selectedIndex, which we handle separately
+	GFxValue result;
+	movieRoot->Invoke("root.mcm_loader.content.mcmMenu.LShoulderPressed", &result, nullptr, 0);
+	_MESSAGE("MCM GoBackOneMenu: Called LShoulderPressed()");
+	
+	// Clear configList_mc.selectedIndex to -1 since LShoulderPressed doesn't do this
+	{
+		GFxValue minusOne;
+		minusOne.SetInt(-1);
+		configList.SetMember("selectedIndex", &minusOne);
+		
+		// Call InvalidateData to refresh visuals (clears highlight)
+		configList.Invoke("InvalidateData", &result, nullptr, 0);
+		_MESSAGE("MCM GoBackOneMenu: Cleared configList selectedIndex and invalidated");
+	}
+	
+	// Refresh HelpList to show its highlight (focus is now on HelpList)
+	GFxValue helpList;
+	if (movieRoot->GetVariable(&helpList, "root.mcm_loader.content.mcmMenu.HelpPanel_mc.HelpList_mc")) {
+		// InvalidateData forces a full refresh of all entries including highlight state
+		helpList.Invoke("InvalidateData", &result, nullptr, 0);
+		_MESSAGE("MCM GoBackOneMenu: Refreshed HelpList");
 	}
 }
 

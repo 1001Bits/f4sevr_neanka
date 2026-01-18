@@ -14,6 +14,8 @@ namespace ScaleformMCM
 	void RegisterForInput(bool bRegister);
 	void ProcessKeyEvent(UInt32 keyCode, bool isDown);
 	void ProcessUserEvent(const char* controlName, bool isDown, int deviceType);
+	void NavigateList(int direction);  // 1=up, 3=down
+	void GoBackOneMenu();  // Clear submenu selection when going back
 
 	void SetKeybindInfo(KeybindInfo ki, GFxMovieRoot* movieRoot, GFxValue* kiValue);
 	void RefreshMenu();
