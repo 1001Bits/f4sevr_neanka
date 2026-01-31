@@ -86,8 +86,8 @@ namespace ScaleformMCM {
 		virtual void Invoke(Args* args) {
 			// Start key handler
 			RegisterForInput(true);
-			// Initialize VR-native input
-			MCMVRInput::Initialize();
+			// Direct OpenVR polling disabled - using game's input layer only
+			// MCMVRInput::Initialize();
 		}
 	};
 
@@ -818,12 +818,23 @@ void ScaleformMCM::RegisterFuncs(GFxValue* codeObj, GFxMovieRoot* movieRoot) {
 class F4SEInputHandler : public BSInputEventUser
 {
 public:
-	F4SEInputHandler() : BSInputEventUser(true), m_lastThumbstickDirectionLeft(0), m_lastThumbstickDirectionRight(0) { }
+	// Repeat timing constants (in milliseconds)
+	static constexpr DWORD REPEAT_DELAY_MS = 400;    // Initial delay before repeat starts
+	static constexpr DWORD REPEAT_RATE_MS = 80;      // Rate of repeat once started
+
+	F4SEInputHandler() : BSInputEventUser(true), 
+		m_lastThumbstickDirectionLeft(0), 
+		m_lastThumbstickDirectionRight(0),
+		m_holdStartTime(0),
+		m_lastRepeatTime(0),
+		m_heldDirection(0),
+		m_heldStickIsLeft(false) { }
 
 	virtual void OnButtonEvent(ButtonEvent * inputEvent)
 	{
-		// Poll VR controllers directly - bypasses game's broken VR→gamepad translation
-		MCMVRInput::Update();
+		// Direct OpenVR polling disabled - using game's input layer only
+		// (VR input comes through MCMInput::OnButtonEvent with deviceType==4)
+		// MCMVRInput::Update();
 
 		UInt32	keyCode;
 		UInt32	deviceType = inputEvent->deviceType;
@@ -836,17 +847,70 @@ public:
 		BSFixedString* control = inputEvent->GetControlID();
 		const char* controlName = control ? control->c_str() : "";
 
+		// Debug: Log ALL button events to understand what's coming through
+		static int allLogCount = 0;
+		if (allLogCount < 100) {
+			_MESSAGE("F4SEInput: deviceType=%u control='%s' keyMask=%u isDown=%.1f timer=%.2f", 
+				deviceType, controlName, keyMask, inputEvent->isDown, timer);
+			allLogCount++;
+		}
+
 		// VR Controller handling (deviceType 4 = Kinect/VR)
 		if (deviceType == 4) {
 			// Debug: Log VR button events
-			static int vrLogCount = 0;
-			if (vrLogCount < 50) {
-				_MESSAGE("MCM VR Button: control='%s' keyMask=%u isDown=%.1f timer=%.2f", 
-					controlName, keyMask, inputEvent->isDown, timer);
-				vrLogCount++;
+			_MESSAGE("MCM VR Button: control='%s' keyMask=%u isDown=%.1f timer=%.2f", 
+				controlName, keyMask, inputEvent->isDown, timer);
+
+			// Check if we're in remap mode (binding hotkeys)
+			bool inRemapMode = ScaleformMCM::IsInRemapMode();
+			
+			if (inRemapMode && isUp) {
+				// In remap mode, send VR-specific keycodes for hotkey binding
+				// Determine VR keycode based on control name
+				UInt32 vrKeyCode = 0;
+				
+				// Right controller
+				if (strcmp(controlName, "WandTrigger") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Right_Trigger;
+				}
+				else if (strcmp(controlName, "WandGrip") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Right_Grip;
+				}
+				else if (strcmp(controlName, "WandButton1") == 0 || strcmp(controlName, "Primary") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Right_A;  // A button
+				}
+				else if (strcmp(controlName, "WandButton2") == 0 || strcmp(controlName, "Secondary") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Right_B;  // B button
+				}
+				else if (strcmp(controlName, "WandThumbstick") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Right_Thumbstick;
+				}
+				// Left controller (Secondary prefix)
+				else if (strcmp(controlName, "SecondaryTrigger") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Left_Trigger;
+				}
+				else if (strcmp(controlName, "SecondaryGrip") == 0 || (strcmp(controlName, "Grip") == 0 && keyMask == 34)) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Left_Grip;
+				}
+				else if (strcmp(controlName, "SecondaryButton1") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Left_A;  // X button
+				}
+				else if (strcmp(controlName, "SecondaryButton2") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Left_B;  // Y button
+				}
+				else if (strcmp(controlName, "SecondaryThumbstick") == 0) {
+					vrKeyCode = MCMVRInput::kVRKeyCode_Left_Thumbstick;
+				}
+				
+				if (vrKeyCode != 0) {
+					_MESSAGE("MCM VR Remap: Sending VR keycode %u for control '%s'", vrKeyCode, controlName);
+					ScaleformMCM::ProcessKeyEvent(vrKeyCode, true);
+					ScaleformMCM::ProcessKeyEvent(vrKeyCode, false);
+					return;
+				}
 			}
 
-			// Translate VR control names to MCM actions
+			// Normal navigation mode - translate VR control names to MCM actions
 			const char* mcmControl = nullptr;
 			UInt32 mcmKeyCode = 0;
 
@@ -900,6 +964,66 @@ public:
 			return;  // Don't process VR events through normal path
 		}
 
+		// Check for VR-like control names even if deviceType isn't 4
+		// Open Composite may report different deviceType but same control names
+		bool isVRControl = (strcmp(controlName, "WandTrigger") == 0 ||
+		                    strcmp(controlName, "SecondaryTrigger") == 0 ||
+		                    strcmp(controlName, "WandGrip") == 0 ||
+		                    strcmp(controlName, "SecondaryGrip") == 0 ||
+		                    strcmp(controlName, "Grip") == 0 ||
+		                    strcmp(controlName, "Primary") == 0 ||
+		                    strcmp(controlName, "Secondary") == 0);
+		
+		if (isVRControl) {
+			_MESSAGE("MCM VR Control (non-VR deviceType %u): control='%s'", deviceType, controlName);
+			
+			const char* mcmControl = nullptr;
+			UInt32 mcmKeyCode = 0;
+			
+			if (strcmp(controlName, "WandTrigger") == 0 || 
+			    strcmp(controlName, "SecondaryTrigger") == 0 ||
+			    strcmp(controlName, "Primary") == 0) {
+				mcmControl = "Accept";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_A;
+			}
+			else if (strcmp(controlName, "WandGrip") == 0 ||
+			         strcmp(controlName, "SecondaryGrip") == 0 ||
+			         strcmp(controlName, "Grip") == 0 ||
+			         strcmp(controlName, "Secondary") == 0) {
+				mcmControl = "LShoulder";
+				mcmKeyCode = InputMap::kGamepadButtonOffset_LEFT_SHOULDER;
+			}
+			
+			if (mcmControl) {
+				if (isDown) {
+					ScaleformMCM::ProcessKeyEvent(mcmKeyCode, true);
+					ScaleformMCM::ProcessUserEvent(mcmControl, true, InputEvent::kDeviceType_Gamepad);
+				} else if (isUp) {
+					ScaleformMCM::ProcessKeyEvent(mcmKeyCode, false);
+					ScaleformMCM::ProcessUserEvent(mcmControl, false, InputEvent::kDeviceType_Gamepad);
+					
+					if (strcmp(mcmControl, "LShoulder") == 0) {
+						_MESSAGE("MCM Grip released (fallback) - calling GoBackOneMenu");
+						ScaleformMCM::GoBackOneMenu();
+					}
+				}
+				return;
+			}
+		}
+
+		// Also check for "Activate" control which is commonly mapped to trigger/accept
+		if (strcmp(controlName, "Activate") == 0 || strcmp(controlName, "Accept") == 0) {
+			_MESSAGE("MCM Activate/Accept control: deviceType=%u", deviceType);
+			if (isDown) {
+				ScaleformMCM::ProcessKeyEvent(InputMap::kGamepadButtonOffset_A, true);
+				ScaleformMCM::ProcessUserEvent("Accept", true, InputEvent::kDeviceType_Gamepad);
+			} else if (isUp) {
+				ScaleformMCM::ProcessKeyEvent(InputMap::kGamepadButtonOffset_A, false);
+				ScaleformMCM::ProcessUserEvent("Accept", false, InputEvent::kDeviceType_Gamepad);
+			}
+			return;
+		}
+
 		if (deviceType == InputEvent::kDeviceType_Mouse) {
 			// Mouse
 			if (keyMask < 2 || keyMask > 7) return;	// Disallow Mouse1, Mouse2, MouseWheelUp and MouseWheelDown
@@ -924,71 +1048,110 @@ public:
 	// VR Fix: Handle thumbstick events for menu navigation
 	virtual void OnThumbstickEvent(ThumbstickEvent * inputEvent)
 	{
-		// NOTE: We do NOT call MCMVRInput::Update() here anymore.
-		// We now directly call NavigateList() which is more reliable.
-		// Calling both would cause double-navigation on some controllers.
-
 		if (!inputEvent) return;
-
-		// Process BOTH thumbsticks for menu navigation
-		// In pause menu, right stick has no other function, so use it for navigation too
 		
-		// Debug: Log thumbstick events only when direction changes
-		if (inputEvent->direction != inputEvent->previousDirection) {
-			_MESSAGE("MCM Thumbstick: stick=0x%X prevDir=%u dir=%u x=%.2f y=%.2f", 
-				inputEvent->stick, inputEvent->previousDirection, inputEvent->direction,
-				inputEvent->x, inputEvent->y);
-		}
-
-		// Track both sticks independently to avoid conflicts
-		UInt32& lastDirection = (inputEvent->stick == 0xB) ? 
-			m_lastThumbstickDirectionLeft : m_lastThumbstickDirectionRight;
-
-		// Thumbstick directions: 0=none, 1=up, 2=right, 3=down, 4=left
-		UInt32 newDirection = inputEvent->direction;
-		UInt32 previousDirection = inputEvent->previousDirection;
-
-		// Only process when direction changes
-		if (newDirection == previousDirection) return;
-
-		// Release previous direction
-		if (lastDirection != 0) {
-			const char* releaseControl = GetControlNameForDirection(lastDirection);
-			if (releaseControl) {
-				UInt32 keyCode = GetKeycodeForDirection(lastDirection);
-				ScaleformMCM::ProcessKeyEvent(keyCode, false);
-				ScaleformMCM::ProcessUserEvent(releaseControl, false, InputEvent::kDeviceType_Gamepad);
+		// Only process thumbstick when MCM is actually open
+		// This prevents blocking the game's native pause menu navigation
+		if (!enabled) return;
+		
+		// stick: 0xB = left, 0xC = right
+		bool isLeftStick = (inputEvent->stick == 0xB);
+		bool isRightStick = (inputEvent->stick == 0xC);
+		
+		UInt32& lastDirection = isLeftStick ? m_lastThumbstickDirectionLeft : m_lastThumbstickDirectionRight;
+		UInt32 currentDirection = inputEvent->direction;
+		DWORD currentTime = GetTickCount();
+		
+		// Direction changed
+		if (currentDirection != lastDirection)
+		{
+			// Release previous direction
+			if (lastDirection != 0)
+			{
+				const char* releaseName = GetControlNameForDirection(lastDirection);
+				if (releaseName)
+				{
+					_MESSAGE("MCM Thumbstick: Release %s (stick=%s)", releaseName, isLeftStick ? "left" : "right");
+					ScaleformMCM::ProcessUserEvent(releaseName, false, InputEvent::kDeviceType_Gamepad);
+				}
+				
+				// Clear held state if this was the stick that was holding
+				if (m_heldDirection != 0 && m_heldStickIsLeft == isLeftStick) {
+					m_heldDirection = 0;
+					m_holdStartTime = 0;
+					m_lastRepeatTime = 0;
+				}
 			}
+			
+			// Press new direction - use NavigateList for direct navigation
+			if (currentDirection != 0)
+			{
+				const char* pressName = GetControlNameForDirection(currentDirection);
+				if (pressName)
+				{
+					_MESSAGE("MCM Thumbstick: Press %s (stick=%s, x=%.2f, y=%.2f)", 
+					         pressName, isLeftStick ? "left" : "right", inputEvent->x, inputEvent->y);
+					
+					// Left thumbstick only handles left/right for slider control
+					// Up/down navigation is handled by right thumbstick only
+					// This prevents double-navigation when both sticks are processed
+					bool isUpDown = (currentDirection == 1 || currentDirection == 3);
+					
+					if (isLeftStick && isUpDown) {
+						// Skip up/down on left thumbstick - don't navigate
+						_MESSAGE("MCM Thumbstick: Skipping up/down on left stick");
+					} else {
+						// Use NavigateList for right stick (all directions) and left stick (left/right only)
+						ScaleformMCM::NavigateList(currentDirection);
+						
+						// Start tracking hold for repeat
+						m_heldDirection = currentDirection;
+						m_heldStickIsLeft = isLeftStick;
+						m_holdStartTime = currentTime;
+						m_lastRepeatTime = currentTime;
+					}
+				}
+			}
+			
+			lastDirection = currentDirection;
 		}
-
-		// Press new direction - call list navigation directly
-		if (newDirection != 0) {
-			const char* pressControl = GetControlNameForDirection(newDirection);
-			if (pressControl) {
-				_MESSAGE("MCM Thumbstick PRESS: stick=0x%X dir=%u control='%s'", inputEvent->stick, newDirection, pressControl);
-				
-				// Left thumbstick (0xB) only handles left/right for slider control
-				// Up/down navigation is handled by right thumbstick only
-				bool isLeftStick = (inputEvent->stick == 0xB);
-				bool isUpDown = (newDirection == 1 || newDirection == 3);
-				
-				if (isLeftStick && isUpDown) {
-					// Skip up/down on left thumbstick - don't navigate
-					_MESSAGE("MCM Thumbstick: Skipping up/down on left stick");
-				} else {
-					// Directly call NavigateList for all directions
-					// 1=up, 2=right, 3=down, 4=left
-					ScaleformMCM::NavigateList(newDirection);
+		// Same direction held - check for repeat
+		else if (currentDirection != 0 && m_heldDirection == currentDirection && m_heldStickIsLeft == isLeftStick)
+		{
+			DWORD elapsed = currentTime - m_holdStartTime;
+			DWORD sinceLastRepeat = currentTime - m_lastRepeatTime;
+			
+			// Only repeat after initial delay
+			if (elapsed >= REPEAT_DELAY_MS)
+			{
+				// Check if enough time passed since last repeat
+				if (sinceLastRepeat >= REPEAT_RATE_MS)
+				{
+					// Left thumbstick only handles left/right for slider control
+					bool isUpDown = (currentDirection == 1 || currentDirection == 3);
+					
+					if (isLeftStick && isUpDown) {
+						// Skip up/down on left thumbstick
+					} else {
+						_MESSAGE("MCM Thumbstick: Repeat %s (elapsed=%lu, rate=%lu)", 
+						         GetControlNameForDirection(currentDirection), elapsed, sinceLastRepeat);
+						ScaleformMCM::NavigateList(currentDirection);
+						m_lastRepeatTime = currentTime;
+					}
 				}
 			}
 		}
-
-		lastDirection = newDirection;
 	}
 
 private:
 	UInt32 m_lastThumbstickDirectionLeft;
 	UInt32 m_lastThumbstickDirectionRight;
+	
+	// Repeat input tracking
+	DWORD m_holdStartTime;     // When the current direction started being held
+	DWORD m_lastRepeatTime;    // When we last sent a repeat input
+	UInt32 m_heldDirection;    // Current held direction (0 if none)
+	bool m_heldStickIsLeft;    // Which stick is holding the direction
 
 	const char* GetControlNameForDirection(UInt32 direction)
 	{
@@ -1034,49 +1197,152 @@ F4SEInputHandler g_scaleformInputHandler;
 
 void ScaleformMCM::ProcessKeyEvent(UInt32 keyCode, bool isDown)
 {
+	_MESSAGE("ProcessKeyEvent ENTER: keyCode=%u isDown=%d", keyCode, isDown);
+	
+	_MESSAGE("ProcessKeyEvent: Checking G::ui.GetUIntPtr()");
+	uintptr_t uiAddr = G::ui.GetUIntPtr();
+	_MESSAGE("ProcessKeyEvent: G::ui addr = 0x%llX", uiAddr);
+	if (uiAddr == 0) {
+		_MESSAGE("ProcessKeyEvent: G::ui not resolved, returning");
+		return;
+	}
+	
+	_MESSAGE("ProcessKeyEvent: Dereferencing G::ui");
+	UI* uiPtr = *G::ui;
+	_MESSAGE("ProcessKeyEvent: UI* = 0x%p", uiPtr);
+	if (!uiPtr) {
+		_MESSAGE("ProcessKeyEvent: UI* is null, returning");
+		return;
+	}
+	
+	_MESSAGE("ProcessKeyEvent: Creating BSFixedString");
 	BSFixedString mainMenuStr("PauseMenu");
-	if ((*G::ui)->IsMenuOpen(mainMenuStr)) {
-		IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	_MESSAGE("ProcessKeyEvent: Calling IsMenuOpen");
+	bool menuOpen = uiPtr->IsMenuOpen(mainMenuStr);
+	_MESSAGE("ProcessKeyEvent: IsMenuOpen = %d", menuOpen);
+	
+	if (menuOpen) {
+		_MESSAGE("ProcessKeyEvent: Calling GetMenu");
+		IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+		_MESSAGE("ProcessKeyEvent: menu = 0x%p", menu);
+		if (!menu) { _MESSAGE("ProcessKeyEvent: menu null"); return; }
+		_MESSAGE("ProcessKeyEvent: menu->movie = 0x%p", menu->movie);
+		if (!menu->movie) { _MESSAGE("ProcessKeyEvent: movie null"); return; }
+		_MESSAGE("ProcessKeyEvent: menu->movie->movieRoot = 0x%p", menu->movie->movieRoot);
+		if (!menu->movie->movieRoot) { _MESSAGE("ProcessKeyEvent: movieRoot null"); return; }
+		
 		GFxMovieRoot* movieRoot = menu->movie->movieRoot;
+		_MESSAGE("ProcessKeyEvent: Setting up args");
 		GFxValue args[2];
 		args[0].SetInt(keyCode);
 		args[1].SetBool(isDown);
-		_MESSAGE("MCM ProcessKeyEvent: keyCode=%u isDown=%d", keyCode, isDown);
 		
-		// Try MCM's content handler
+		_MESSAGE("ProcessKeyEvent: Invoking mcm_loader.content.ProcessKeyEvent");
 		movieRoot->Invoke("root.mcm_loader.content.ProcessKeyEvent", nullptr, args, 2);
-		
-		// Also try native pause menu paths that might handle navigation
-		// These are common Scaleform/Flash patterns for menu navigation
+		_MESSAGE("ProcessKeyEvent: Invoking Menu_mc.ProcessKeyEvent");
 		movieRoot->Invoke("root.Menu_mc.ProcessKeyEvent", nullptr, args, 2);
+		_MESSAGE("ProcessKeyEvent: Invoking root.ProcessKeyEvent");
 		movieRoot->Invoke("root.ProcessKeyEvent", nullptr, args, 2);
-	} else {
-		_MESSAGE("MCM ProcessKeyEvent SKIPPED: PauseMenu not open, keyCode=%u", keyCode);
+		_MESSAGE("ProcessKeyEvent: All invokes complete");
 	}
+	_MESSAGE("ProcessKeyEvent EXIT");
 }
 
 void ScaleformMCM::ProcessUserEvent(const char * controlName, bool isDown, int deviceType)
 {
+	_MESSAGE("ProcessUserEvent ENTER: control=%s isDown=%d device=%d", controlName, isDown, deviceType);
+	
+	_MESSAGE("ProcessUserEvent: Checking G::ui.GetUIntPtr()");
+	uintptr_t uiAddr = G::ui.GetUIntPtr();
+	_MESSAGE("ProcessUserEvent: G::ui addr = 0x%llX", uiAddr);
+	if (uiAddr == 0) {
+		_MESSAGE("ProcessUserEvent: G::ui not resolved, returning");
+		return;
+	}
+	
+	_MESSAGE("ProcessUserEvent: Dereferencing G::ui");
+	UI* uiPtr = *G::ui;
+	_MESSAGE("ProcessUserEvent: UI* = 0x%p", uiPtr);
+	if (!uiPtr) {
+		_MESSAGE("ProcessUserEvent: UI* is null, returning");
+		return;
+	}
+	
+	_MESSAGE("ProcessUserEvent: Creating BSFixedString");
 	BSFixedString mainMenuStr("PauseMenu");
-	if ((*G::ui)->IsMenuOpen(mainMenuStr)) {
-		IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	_MESSAGE("ProcessUserEvent: Calling IsMenuOpen");
+	bool menuOpen = uiPtr->IsMenuOpen(mainMenuStr);
+	_MESSAGE("ProcessUserEvent: IsMenuOpen = %d", menuOpen);
+	
+	if (menuOpen) {
+		_MESSAGE("ProcessUserEvent: Calling GetMenu");
+		IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+		_MESSAGE("ProcessUserEvent: menu = 0x%p", menu);
+		if (!menu) { _MESSAGE("ProcessUserEvent: menu null"); return; }
+		_MESSAGE("ProcessUserEvent: menu->movie = 0x%p", menu->movie);
+		if (!menu->movie) { _MESSAGE("ProcessUserEvent: movie null"); return; }
+		_MESSAGE("ProcessUserEvent: menu->movie->movieRoot = 0x%p", menu->movie->movieRoot);
+		if (!menu->movie->movieRoot) { _MESSAGE("ProcessUserEvent: movieRoot null"); return; }
+		
 		GFxMovieRoot* movieRoot = menu->movie->movieRoot;
+		_MESSAGE("ProcessUserEvent: Setting up args");
 		GFxValue args[3];
 		args[0].SetString(controlName);
 		args[1].SetBool(isDown);
 		args[2].SetInt(deviceType);
+		_MESSAGE("ProcessUserEvent: Invoking mcm_loader.content.ProcessUserEvent");
 		movieRoot->Invoke("root.mcm_loader.content.ProcessUserEvent", nullptr, args, 3);
+		_MESSAGE("ProcessUserEvent: Invoke complete");
 	}
+	_MESSAGE("ProcessUserEvent EXIT");
+}
+
+bool ScaleformMCM::IsInRemapMode()
+{
+	// MCM_REMAP_MODE = 1 in ActionScript
+	const int MCM_REMAP_MODE = 1;
+	
+	uintptr_t uiAddr = G::ui.GetUIntPtr();
+	if (uiAddr == 0) return false;
+	
+	UI* uiPtr = *G::ui;
+	if (!uiPtr) return false;
+		
+	BSFixedString mainMenuStr("PauseMenu");
+	if (!uiPtr->IsMenuOpen(mainMenuStr)) return false;
+	
+	IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+	if (!menu || !menu->movie || !menu->movie->movieRoot) return false;
+	GFxMovieRoot* movieRoot = menu->movie->movieRoot;
+	
+	GFxValue iModeValue;
+	if (movieRoot->GetVariable(&iModeValue, "root.mcm_loader.content.mcmMenu.iMode")) {
+		int iMode = iModeValue.IsNumber() ? (int)iModeValue.GetNumber() : 0;
+		return iMode == MCM_REMAP_MODE;
+	}
+	return false;
+}
+
+bool ScaleformMCM::IsMCMInputActive()
+{
+	// Return whether the MCM input handler is enabled
+	// This is true when MCM content is loaded, false when MCM closes
+	return g_scaleformInputHandler.enabled;
 }
 
 // Directly navigate MCM list - bypasses event system for more reliable VR input
 // Directions: 1=up, 2=right, 3=down, 4=left
 void ScaleformMCM::NavigateList(int direction)
 {
-	BSFixedString mainMenuStr("PauseMenu");
-	if (!(*G::ui)->IsMenuOpen(mainMenuStr)) return;
+	if (G::ui.GetUIntPtr() == 0) return;
+	UI* uiPtr = *G::ui;
+	if (!uiPtr) return;
 	
-	IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	BSFixedString mainMenuStr("PauseMenu");
+	if (!uiPtr->IsMenuOpen(mainMenuStr)) return;
+	
+	IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+	if (!menu || !menu->movie || !menu->movie->movieRoot) return;
 	GFxMovieRoot* movieRoot = menu->movie->movieRoot;
 	
 	// Get the MCM menu content
@@ -1322,9 +1588,21 @@ void ScaleformMCM::NavigateList(int direction)
 	}
 	
 	if (targetList) {
+		// For HelpList (root menu), we need to ensure stage.focus is set correctly
+		// BEFORE moveSelection because UniversalListEntry.SetEntryText checks stage.focus
+		// to determine border.alpha during the SetEntry calls in doSetSelectedIndex
+		if (!configActive && helpActive) {
+			GFxValue stage;
+			if (movieRoot->GetVariable(&stage, "root.mcm_loader.content.mcmMenu.stage")) {
+				stage.SetMember("focus", targetList);
+				_MESSAGE("MCM NavigateList: Set stage.focus to HelpList_mc");
+			}
+		}
+		
 		const char* method = (direction == 1) ? "moveSelectionUp" : "moveSelectionDown";
 		GFxValue result;
 		targetList->Invoke(method, &result, nullptr, 0);
+		
 		_MESSAGE("MCM NavigateList: Called %s.%s", listName, method);
 	} else {
 		_MESSAGE("MCM NavigateList: Could not determine which list to navigate");
@@ -1333,9 +1611,14 @@ void ScaleformMCM::NavigateList(int direction)
 
 void ScaleformMCM::RefreshMenu()
 {
+	if (G::ui.GetUIntPtr() == 0) return;
+	UI* uiPtr = *G::ui;
+	if (!uiPtr) return;
+	
 	BSFixedString mainMenuStr("PauseMenu");
-	if ((*G::ui)->IsMenuOpen(mainMenuStr)) {
-		IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	if (uiPtr->IsMenuOpen(mainMenuStr)) {
+		IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+		if (!menu || !menu->movie || !menu->movie->movieRoot) return;
 		GFxMovieRoot* movieRoot = menu->movie->movieRoot;
 		movieRoot->Invoke("root.mcm_loader.content.RefreshMCM", nullptr, nullptr, 0);
 	}
@@ -1357,10 +1640,15 @@ void ScaleformMCM::GoBackOneMenu()
 	g_lastGoBackTime = currentTime;
 	g_goBackTimeInitialized = true;
 	
-	BSFixedString mainMenuStr("PauseMenu");
-	if (!(*G::ui)->IsMenuOpen(mainMenuStr)) return;
+	if (G::ui.GetUIntPtr() == 0) return;
+	UI* uiPtr = *G::ui;
+	if (!uiPtr) return;
 	
-	IMenu* menu = (*G::ui)->GetMenu(mainMenuStr);
+	BSFixedString mainMenuStr("PauseMenu");
+	if (!uiPtr->IsMenuOpen(mainMenuStr)) return;
+	
+	IMenu* menu = uiPtr->GetMenu(mainMenuStr);
+	if (!menu || !menu->movie || !menu->movie->movieRoot) return;
 	GFxMovieRoot* movieRoot = menu->movie->movieRoot;
 	
 	// Check if we're on the root menu by looking at configPanel's selectedIndex
@@ -1460,10 +1748,11 @@ void ScaleformMCM::SetKeybindInfo(KeybindInfo ki, GFxMovieRoot * movieRoot, GFxV
 }
 
 void ScaleformMCM::RegisterForInput(bool bRegister) {
+	tArray<BSInputEventUser*>* inputEvents = &((*G::menuControls)->inputEvents);
+	BSInputEventUser* inputHandler = &g_scaleformInputHandler;
+	
 	if (bRegister) {
 		g_scaleformInputHandler.enabled = true;
-		tArray<BSInputEventUser*>* inputEvents = &((*G::menuControls)->inputEvents);
-		BSInputEventUser* inputHandler = &g_scaleformInputHandler;
 		int idx = inputEvents->GetItemIndex(inputHandler);
 		if (idx == -1) {
 			inputEvents->Push(&g_scaleformInputHandler);
@@ -1471,6 +1760,12 @@ void ScaleformMCM::RegisterForInput(bool bRegister) {
 		}
 	} else {
 		g_scaleformInputHandler.enabled = false;
+		// Actually remove the handler from the array to prevent consuming events
+		int idx = inputEvents->GetItemIndex(inputHandler);
+		if (idx != -1) {
+			inputEvents->Remove(idx);
+			_MESSAGE("Unregistered from input events.");
+		}
 	}
 }
 
