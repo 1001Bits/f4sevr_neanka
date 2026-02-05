@@ -1475,9 +1475,10 @@ void ScaleformMCM::NavigateList(int direction)
 			}
 			_MESSAGE("MCM NavigateList: LEFT in configList for slider/stepper");
 		} else if (helpActive) {
-			// In HelpList: go back (same as grip/LShoulder)
-			GoBackOneMenu();
-			_MESSAGE("MCM NavigateList: LEFT in HelpList = GoBack");
+			// In HelpList (root menu): LEFT does nothing - use grip/B button to go back/close
+			// Don't call GoBackOneMenu() here as it can corrupt the input event queue
+			// when sending Cancel events while still inside PerformInputProcessing
+			_MESSAGE("MCM NavigateList: LEFT in HelpList - ignored (use grip to close)");
 		}
 		return;
 	}
